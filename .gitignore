@@ -1,0 +1,6 @@
+build/
+*.mov
+*.mp4
+*.m4v
+*.gif
+.DS_Store

@@ -1,0 +1,194 @@
+#!/bin/zsh
+# custom-aerial — play your own video on the macOS lock screen and desktop
+# by putting it in place of the aerial you have selected as wallpaper.
+set -euo pipefail
+
+SRC_DIR="${0:A:h}"
+SOURCES="$SRC_DIR/Sources"
+BUILD="$SRC_DIR/build"
+TARGET="$(uname -m)-apple-macos14.0"
+
+WALLPAPER="$HOME/Library/Application Support/com.apple.wallpaper"
+VIDEOS="$WALLPAPER/aerials/videos"
+INDEX="$WALLPAPER/Store/Index.plist"
+STATE="$HOME/Library/Application Support/custom-aerial"
+BACKUP="$STATE/backup"
+
+AWAKE_NAME="Lock Awake"
+AWAKE_ID="local.customaerial.lockawake"
+AWAKE_APP="$HOME/Applications/$AWAKE_NAME.app"
+AWAKE_PLIST="$HOME/Library/LaunchAgents/$AWAKE_ID.plist"
+AWAKE_LOG="$HOME/Library/Logs/LockAwake.log"
+DOMAIN="gui/$(id -u)"
+
+die() { print -u2 "custom-aerial: $*"; exit 1; }
+
+usage() {
+  cat <<EOF
+Usage:
+  custom-aerial set <video> [minSeconds]   Convert the video and put it in place of the selected aerial
+  custom-aerial restore                    Put Apple's original aerial back
+  custom-aerial status                     Show the selected aerial and whether it is replaced
+  custom-aerial lockawake on|off|status    Keep the display on while locked (only on power)
+
+Before 'set': System Settings > Wallpaper, pick any aerial (for example Tahiti Coast),
+wait until it has downloaded, and turn on "Show as screen saver" if you want.
+EOF
+}
+
+need_swiftc() { command -v swiftc >/dev/null || die "swiftc not found; run: xcode-select --install"; }
+
+# Asset ID of the aerial that is the current desktop wallpaper.
+selected_asset() {
+  [[ -f "$INDEX" ]] || die "no wallpaper settings found at $INDEX"
+  /usr/bin/python3 - "$INDEX" <<'EOF'
+import plistlib, sys
+d = plistlib.load(open(sys.argv[1], 'rb'))
+for scope in ('AllSpacesAndDisplays', 'SystemDefault'):
+    for c in d.get(scope, {}).get('Desktop', {}).get('Content', {}).get('Choices', []):
+        if c.get('Provider') == 'com.apple.wallpaper.choice.aerials':
+            cfg = c.get('Configuration')
+            if isinstance(cfg, bytes):
+                cfg = plistlib.loads(cfg)
+            if cfg and cfg.get('assetID'):
+                print(cfg['assetID']); sys.exit(0)
+sys.exit(1)
+EOF
+}
+
+slot_file() {
+  local id; id="$(selected_asset)" || die "the wallpaper is not an aerial; pick one in System Settings > Wallpaper first"
+  local f="$VIDEOS/$id.mov"
+  [[ -f "$f" ]] || die "aerial $id is not downloaded yet; open System Settings > Wallpaper and let it download"
+  print -r -- "$f"
+}
+
+reload_player() { killall WallpaperAerialsExtension 2>/dev/null || true; }
+
+build_aerialize() {
+  need_swiftc
+  mkdir -p "$BUILD"
+  if [[ ! -x "$BUILD/aerialize" || "$SOURCES/aerialize.swift" -nt "$BUILD/aerialize" ]]; then
+    print "Compiling aerialize…"
+    swiftc -O -target "$TARGET" -swift-version 5 -o "$BUILD/aerialize" "$SOURCES/aerialize.swift"
+  fi
+}
+
+cmd_set() {
+  (( $# >= 1 )) || die "set: give a video file"
+  local src="${1:A}" secs="${2:-300}"
+  [[ -f "$src" ]] || die "not a file: $1"
+  local slot; slot="$(slot_file)"
+  local id="${slot:t:r}"
+
+  build_aerialize
+  local out="$BUILD/$id.mov"
+  print "Converting ${src:t} (this can take several minutes)…"
+  "$BUILD/aerialize" "$src" "$out" "$secs"
+
+  mkdir -p "$BACKUP"
+  if [[ ! -f "$BACKUP/$id.mov" ]]; then
+    cp -p "$slot" "$BACKUP/$id.mov"
+    print "Backed up Apple's original to $BACKUP/$id.mov"
+  fi
+  # Write over the file in place so it keeps the attributes the system set on it.
+  cat "$out" > "$slot"
+  rm -f "$out"
+  reload_player
+  print "Done. Lock the screen (ctrl-cmd-Q) to see it."
+}
+
+cmd_restore() {
+  local slot; slot="$(slot_file)"
+  local id="${slot:t:r}"
+  [[ -f "$BACKUP/$id.mov" ]] || die "no backup for $id in $BACKUP"
+  cat "$BACKUP/$id.mov" > "$slot"
+  reload_player
+  print "Restored Apple's aerial $id."
+}
+
+cmd_status() {
+  local slot; slot="$(slot_file)"
+  local id="${slot:t:r}"
+  print "Selected aerial: $id"
+  if [[ -f "$BACKUP/$id.mov" ]] && ! cmp -s "$BACKUP/$id.mov" "$slot"; then
+    print "Replaced with your video (original backed up)."
+  else
+    print "Apple's original."
+  fi
+  launchctl print "$DOMAIN/$AWAKE_ID" >/dev/null 2>&1 && print "$AWAKE_NAME: on" || print "$AWAKE_NAME: off"
+}
+
+plist_header() {
+  print '<?xml version="1.0" encoding="UTF-8"?>'
+  print '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+  print '<plist version="1.0">'
+}
+
+cmd_lockawake() {
+  case "${1:-status}" in
+    on)
+      need_swiftc
+      print "Compiling $AWAKE_NAME…"
+      local out="$BUILD/$AWAKE_NAME.app"
+      rm -rf "$out"; mkdir -p "$out/Contents/MacOS"
+      swiftc -O -module-name LockAwake -target "$TARGET" -framework AppKit -framework IOKit \
+        -o "$out/Contents/MacOS/LockAwake" "$SOURCES/LockAwake/main.swift"
+      { plist_header; cat <<EOF
+<dict>
+  <key>CFBundleExecutable</key><string>LockAwake</string>
+  <key>CFBundleIdentifier</key><string>$AWAKE_ID</string>
+  <key>CFBundleName</key><string>$AWAKE_NAME</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSUIElement</key><true/>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+</dict>
+</plist>
+EOF
+      } > "$out/Contents/Info.plist"
+      codesign --force --sign - "$out" >/dev/null 2>&1 || die "codesign failed"
+      mkdir -p "${AWAKE_APP:h}"; rm -rf "$AWAKE_APP"; cp -R "$out" "$AWAKE_APP"
+
+      mkdir -p "${AWAKE_PLIST:h}"
+      { plist_header; cat <<EOF
+<dict>
+  <key>Label</key><string>$AWAKE_ID</string>
+  <key>ProgramArguments</key>
+  <array><string>$AWAKE_APP/Contents/MacOS/LockAwake</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardErrorPath</key><string>$AWAKE_LOG</string>
+</dict>
+</plist>
+EOF
+      } > "$AWAKE_PLIST"
+      launchctl bootout "$DOMAIN/$AWAKE_ID" 2>/dev/null || true
+      launchctl bootstrap "$DOMAIN" "$AWAKE_PLIST"
+      print "$AWAKE_NAME is on: the display stays on while locked, when on power."
+      ;;
+    off)
+      launchctl bootout "$DOMAIN/$AWAKE_ID" 2>/dev/null || true
+      rm -f "$AWAKE_PLIST"; rm -rf "$AWAKE_APP"
+      print "$AWAKE_NAME is off."
+      ;;
+    status)
+      if launchctl print "$DOMAIN/$AWAKE_ID" >/dev/null 2>&1; then
+        print "$AWAKE_NAME: on"; tail -n 3 "$AWAKE_LOG" 2>/dev/null || true
+      else
+        print "$AWAKE_NAME: off"
+      fi
+      ;;
+    *) die "lockawake: use on, off or status" ;;
+  esac
+}
+
+case "${1:-}" in
+  set)       shift; cmd_set "$@" ;;
+  restore)   cmd_restore ;;
+  status)    cmd_status ;;
+  lockawake) shift; cmd_lockawake "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
