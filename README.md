@@ -53,6 +53,7 @@ About 30 seconds after you lock the Mac, `loginwindow` turns the display off. Lo
 
 - It holds a "prevent display sleep" power assertion only while the screen is locked **and** the Mac is on power.
 - On unlock or on battery, it releases the assertion.
+- 3 s after a display is added or removed (lid closed, monitor plugged or unplugged), it restarts the aerial player. macOS's player can get stuck across such a change and then shows a frozen frame on every lock. The restart may show one black frame.
 
 It runs as a LaunchAgent (`~/Library/LaunchAgents/local.customaerial.lockawake.plist`) and logs to `~/Library/Logs/LockAwake.log`.
 

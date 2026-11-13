@@ -4,6 +4,11 @@
 // loginwindow turns the display off ~30s after locking (password-prompt
 // timeout) unless a PreventUserIdleDisplaySleep assertion is held. This agent
 // holds one only in that state, and releases it on unlock or on battery.
+//
+// It also restarts the aerial player a few seconds after a display is added
+// or removed (lid closed, monitor plugged or unplugged). macOS's player can
+// get stuck in its ramp-down state across such a change, and then the lock
+// screen shows a frozen frame until the player restarts.
 
 import AppKit
 import IOKit.ps
@@ -18,6 +23,7 @@ final class LockAwake {
     private var onAC = false
     private var assertion: IOPMAssertionID = 0
     private var holding = false
+    private var pendingRestart: DispatchWorkItem?
 
     func start() {
         locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
@@ -40,7 +46,26 @@ final class LockAwake {
         }, ctx)?.takeRetainedValue() {
             CFRunLoopAddSource(CFRunLoopGetMain(), src, .defaultMode)
         }
+        CGDisplayRegisterReconfigurationCallback({ _, flags, ctx in
+            guard let ctx, flags.contains(.addFlag) || flags.contains(.removeFlag) else { return }
+            let me = Unmanaged<LockAwake>.fromOpaque(ctx).takeUnretainedValue()
+            DispatchQueue.main.async { me.restartAerialSoon() }
+        }, ctx)
         update("start")
+    }
+
+    /// One restart per burst of display changes, once things have settled.
+    private func restartAerialSoon() {
+        pendingRestart?.cancel()
+        let work = DispatchWorkItem {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+            p.arguments = ["WallpaperAerialsExtension"]
+            do { try p.run(); p.waitUntilExit(); log("display change: aerial player restarted (exit \(p.terminationStatus))") }
+            catch { log("display change: could not restart aerial player: \(error)") }
+        }
+        pendingRestart = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
     }
 
     static func isOnAC() -> Bool {
